@@ -45,7 +45,6 @@ public class ParquetSchemaGenerator<T>
             
         // 使用反射获取类型 T 的所有公共属性
         var properties = _recordType.GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.FlattenHierarchy);
-
         foreach (var prop in properties)
         {
             // 如果属性在忽略列表中，则跳过
