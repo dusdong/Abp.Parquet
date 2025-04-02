@@ -12,7 +12,7 @@ public class ParquetWriterConfiguration
     /// 默认批处理大小
     /// </summary>
     public static readonly int DefaultBatchSize = 10000;
-    
+
     /// <summary>
     /// Parquet 文件写入选项
     /// </summary>
@@ -27,7 +27,7 @@ public class ParquetWriterConfiguration
     /// 压缩级别（部分压缩方法支持），默认使用最佳压缩
     /// </summary>
     public CompressionLevel CompressionLevel { get; set; } = CompressionLevel.Optimal;
-    
+
     /// <summary>
     /// 批处理大小，当记录数超过此值时进行分批写入
     /// </summary>
@@ -62,17 +62,17 @@ public class ParquetWriterConfiguration
     /// 是否将 DateTimeOffset 视为字符串
     /// </summary>
     public bool TreatDateTimeOffsetAsString { get; set; } = false;
-    
+
     /// <summary>
     /// 异常重试次数，默认为 3
     /// </summary>
     public int RetryCount { get; set; } = 3;
-    
+
     /// <summary>
     /// 重试等待时间（毫秒），默认为 1000ms
     /// </summary>
     public int RetryDelayMilliseconds { get; set; } = 1000;
-    
+
     /// <summary>
     /// 为大数据集创建优化的配置
     /// </summary>
@@ -83,10 +83,10 @@ public class ParquetWriterConfiguration
         {
             CompressionMethod = CompressionMethod.Gzip,
             CompressionLevel = CompressionLevel.Fastest, // 优先速度
-            BatchSize = 50000                          // 更大的批次
+            BatchSize = 50000 // 更大的批次
         };
     }
-    
+
     /// <summary>
     /// 为高压缩率创建优化的配置
     /// </summary>
@@ -97,7 +97,7 @@ public class ParquetWriterConfiguration
         {
             CompressionMethod = CompressionMethod.Gzip,
             CompressionLevel = CompressionLevel.Optimal, // 优先压缩率
-            BatchSize = 10000                          // 适中的批次大小
+            BatchSize = 10000 // 适中的批次大小
         };
     }
 }

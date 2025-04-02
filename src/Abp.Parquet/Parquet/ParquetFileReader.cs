@@ -1,4 +1,5 @@
 ﻿using System.Collections;
+using System.Diagnostics;
 using Parquet;
 using Parquet.Data;
 using Parquet.Schema;
@@ -35,29 +36,29 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
     {
         if (string.IsNullOrWhiteSpace(filePath))
             throw new ArgumentException("文件路径不能为空。", nameof(filePath));
-        
+
         if (!File.Exists(filePath))
             throw new FileNotFoundException("找不到指定的 Parquet 文件。", filePath);
 
         Stream fileStream = null;
         ParquetReader reader = null;
-        
+
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
-            
+
             // 打开文件流
             fileStream = new FileStream(
-                filePath, 
-                FileMode.Open, 
-                FileAccess.Read, 
-                FileShare.Read, 
-                4096, 
+                filePath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                4096,
                 FileOptions.Asynchronous);
-            
+
             // 创建 Parquet 读取器 - 使用真正的异步调用
             reader = await ParquetReader.CreateAsync(fileStream).ConfigureAwait(false);
-            
+
             return new ParquetFileReader(filePath, fileStream, reader);
         }
         catch (OperationCanceledException)
@@ -65,7 +66,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             // 释放资源
             reader?.Dispose();
             fileStream?.Dispose();
-            
+
             throw new ParquetOperationCanceledException("Parquet 文件打开操作已取消。");
         }
         catch (Exception ex)
@@ -73,12 +74,12 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             // 确保资源被释放
             reader?.Dispose();
             fileStream?.Dispose();
-            
+
             if (ex is IOException ioEx)
             {
                 throw new ParquetParserException($"打开 Parquet 文件时发生 I/O 错误: {ioEx.Message}", filePath, ioEx);
             }
-            
+
             throw new ParquetParserException($"无法打开 Parquet 文件: {ex.Message}", filePath, ex);
         }
     }
@@ -100,13 +101,13 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             for (int i = 0; i < _reader.RowGroupCount; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                
+
                 using (var groupReader = _reader.OpenRowGroupReader(i))
                 {
                     totalRows += groupReader.RowCount;
                 }
             }
-            
+
             return totalRows;
         }
         catch (OperationCanceledException)
@@ -141,33 +142,33 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             throw new ObjectDisposedException(nameof(ParquetFileReader));
 
         var results = new List<T>();
-        
+
         try
         {
             // 获取类型的属性信息
             var properties = typeof(T).GetProperties();
-            
+
             // 获取所有字段
             var fields = _reader.Schema.Fields.OfType<DataField>().ToArray();
-            
+
             // 处理每个行组
             for (int groupIndex = 0; groupIndex < _reader.RowGroupCount; groupIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                
+
                 using (var groupReader = _reader.OpenRowGroupReader(groupIndex))
                 {
                     // 读取所有列 - 注意这里同步等待异步操作
                     var columns = ReadColumnsAsync(groupReader, fields, cancellationToken).GetAwaiter().GetResult();
-                    
+
                     // 处理每一行数据
                     long rowCount = groupReader.RowCount;
                     for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        
+
                         var record = new T();
-                        
+
                         // 设置每个属性的值
                         foreach (var property in properties)
                         {
@@ -186,17 +187,17 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
                                     catch (Exception ex)
                                     {
                                         // 记录转换失败的详细信息
-                                        System.Diagnostics.Debug.WriteLine($"属性 {property.Name} 值转换失败: {ex.Message}");
+                                        Debug.WriteLine($"属性 {property.Name} 值转换失败: {ex.Message}");
                                     }
                                 }
                             }
                         }
-                        
+
                         results.Add(record);
                     }
                 }
             }
-            
+
             return results;
         }
         catch (OperationCanceledException)
@@ -226,33 +227,33 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             throw new ObjectDisposedException(nameof(ParquetFileReader));
 
         var results = new List<T>();
-        
+
         try
         {
             // 获取类型的属性信息
             var properties = typeof(T).GetProperties();
-            
+
             // 获取所有字段
             var fields = _reader.Schema.Fields.OfType<DataField>().ToArray();
-            
+
             // 处理每个行组
             for (int groupIndex = 0; groupIndex < _reader.RowGroupCount; groupIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                
+
                 using (var groupReader = _reader.OpenRowGroupReader(groupIndex))
                 {
                     // 读取所有列 - 直接使用异步方法
                     var columns = await ReadColumnsAsync(groupReader, fields, cancellationToken);
-                    
+
                     // 处理每一行数据
                     long rowCount = groupReader.RowCount;
                     for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        
+
                         var record = new T();
-                        
+
                         // 设置每个属性的值
                         foreach (var property in properties)
                         {
@@ -271,17 +272,17 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
                                     catch (Exception ex)
                                     {
                                         // 记录转换失败的详细信息
-                                        System.Diagnostics.Debug.WriteLine($"属性 {property.Name} 值转换失败: {ex.Message}");
+                                        Debug.WriteLine($"属性 {property.Name} 值转换失败: {ex.Message}");
                                     }
                                 }
                             }
                         }
-                        
+
                         results.Add(record);
                     }
                 }
             }
-            
+
             return results;
         }
         catch (OperationCanceledException)
@@ -310,30 +311,30 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             throw new ObjectDisposedException(nameof(ParquetFileReader));
 
         var results = new List<Dictionary<string, object>>();
-        
+
         try
         {
             // 获取所有字段
             var fields = _reader.Schema.Fields.OfType<DataField>().ToArray();
-            
+
             // 处理每个行组
             for (int groupIndex = 0; groupIndex < _reader.RowGroupCount; groupIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                
+
                 using (var groupReader = _reader.OpenRowGroupReader(groupIndex))
                 {
                     // 读取所有列 - 注意这里同步等待异步操作
                     var columns = ReadColumnsAsync(groupReader, fields, cancellationToken).GetAwaiter().GetResult();
-                    
+
                     // 处理每一行数据
                     long rowCount = groupReader.RowCount;
                     for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        
+
                         var record = new Dictionary<string, object>();
-                        
+
                         // 设置每个字段的值
                         foreach (var field in fields)
                         {
@@ -348,12 +349,12 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
                                 record[field.Name] = null;
                             }
                         }
-                        
+
                         results.Add(record);
                     }
                 }
             }
-            
+
             return results;
         }
         catch (OperationCanceledException)
@@ -382,30 +383,30 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             throw new ObjectDisposedException(nameof(ParquetFileReader));
 
         var results = new List<Dictionary<string, object>>();
-        
+
         try
         {
             // 获取所有字段
             var fields = _reader.Schema.Fields.OfType<DataField>().ToArray();
-            
+
             // 处理每个行组
             for (int groupIndex = 0; groupIndex < _reader.RowGroupCount; groupIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                
+
                 using (var groupReader = _reader.OpenRowGroupReader(groupIndex))
                 {
                     // 读取所有列 - 直接使用异步方法
                     var columns = await ReadColumnsAsync(groupReader, fields, cancellationToken);
-                    
+
                     // 处理每一行数据
                     long rowCount = groupReader.RowCount;
                     for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
                     {
                         cancellationToken.ThrowIfCancellationRequested();
-                        
+
                         var record = new Dictionary<string, object>();
-                        
+
                         // 设置每个字段的值
                         foreach (var field in fields)
                         {
@@ -420,12 +421,12 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
                                 record[field.Name] = null;
                             }
                         }
-                        
+
                         results.Add(record);
                     }
                 }
             }
-            
+
             return results;
         }
         catch (OperationCanceledException)
@@ -456,28 +457,28 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
 
         // 获取类型的属性信息
         var properties = typeof(T).GetProperties();
-        
+
         // 获取所有字段
         var fields = _reader.Schema.Fields.OfType<DataField>().ToArray();
-        
+
         // 处理每个行组
         for (int groupIndex = 0; groupIndex < _reader.RowGroupCount; groupIndex++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            
+
             using (var groupReader = _reader.OpenRowGroupReader(groupIndex))
             {
                 // 读取所有列 - 同步等待异步操作
                 var columns = ReadColumnsAsync(groupReader, fields, cancellationToken).GetAwaiter().GetResult();
-                
+
                 // 处理每一行数据
                 long rowCount = groupReader.RowCount;
                 for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    
+
                     var record = new T();
-                    
+
                     // 设置每个属性的值
                     foreach (var property in properties)
                     {
@@ -496,12 +497,12 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
                                 catch (Exception ex)
                                 {
                                     // 记录转换失败的详细信息
-                                    System.Diagnostics.Debug.WriteLine($"属性 {property.Name} 值转换失败: {ex.Message}");
+                                    Debug.WriteLine($"属性 {property.Name} 值转换失败: {ex.Message}");
                                 }
                             }
                         }
                     }
-                    
+
                     yield return record;
                 }
             }
@@ -520,25 +521,25 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
 
         // 获取所有字段
         var fields = _reader.Schema.Fields.OfType<DataField>().ToArray();
-        
+
         // 处理每个行组
         for (int groupIndex = 0; groupIndex < _reader.RowGroupCount; groupIndex++)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            
+
             using (var groupReader = _reader.OpenRowGroupReader(groupIndex))
             {
                 // 读取所有列 - 同步等待异步操作
                 var columns = ReadColumnsAsync(groupReader, fields, cancellationToken).GetAwaiter().GetResult();
-                
+
                 // 处理每一行数据
                 long rowCount = groupReader.RowCount;
                 for (int rowIndex = 0; rowIndex < rowCount; rowIndex++)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
-                    
+
                     var record = new Dictionary<string, object>();
-                    
+
                     // 设置每个字段的值
                     foreach (var field in fields)
                     {
@@ -553,7 +554,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
                             record[field.Name] = null;
                         }
                     }
-                    
+
                     yield return record;
                 }
             }
@@ -580,7 +581,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             var field = _reader.Schema.Fields
                 .OfType<DataField>()
                 .FirstOrDefault(f => f.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase));
-                
+
             if (field == null)
                 throw new ParquetParserException($"找不到列: {columnName}", _filePath);
 
@@ -589,17 +590,17 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             var columnType = field.ClrType;
             Array result = Array.CreateInstance(columnType, totalRowCount);
             long currentIndex = 0;
-            
+
             // 读取每个行组的数据
             for (int groupIndex = 0; groupIndex < _reader.RowGroupCount; groupIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                
+
                 using (var groupReader = _reader.OpenRowGroupReader(groupIndex))
                 {
                     // 读取当前行组的列 - 同步等待异步操作
                     var dataColumn = groupReader.ReadColumnAsync(field).GetAwaiter().GetResult();
-                    
+
                     // 复制到结果数组
                     if (dataColumn.Data != null)
                     {
@@ -608,7 +609,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
                     }
                 }
             }
-            
+
             return result;
         }
         catch (OperationCanceledException)
@@ -646,7 +647,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             var field = _reader.Schema.Fields
                 .OfType<DataField>()
                 .FirstOrDefault(f => f.Name.Equals(columnName, StringComparison.OrdinalIgnoreCase));
-                
+
             if (field == null)
                 throw new ParquetParserException($"找不到列: {columnName}", _filePath);
 
@@ -655,17 +656,17 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             var columnType = field.ClrType;
             Array result = Array.CreateInstance(columnType, totalRowCount);
             long currentIndex = 0;
-            
+
             // 读取每个行组的数据
             for (int groupIndex = 0; groupIndex < _reader.RowGroupCount; groupIndex++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                
+
                 using (var groupReader = _reader.OpenRowGroupReader(groupIndex))
                 {
                     // 读取当前行组的列 - 直接使用异步方法
                     var dataColumn = await groupReader.ReadColumnAsync(field);
-                    
+
                     // 复制到结果数组
                     if (dataColumn.Data != null)
                     {
@@ -674,7 +675,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
                     }
                 }
             }
-            
+
             return result;
         }
         catch (OperationCanceledException)
@@ -696,7 +697,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
     /// 读取指定行组的所有列
     /// </summary>
     private async Task<Dictionary<string, DataColumn>> ReadColumnsAsync(
-        ParquetRowGroupReader groupReader, 
+        ParquetRowGroupReader groupReader,
         DataField[] fields,
         CancellationToken cancellationToken)
     {
@@ -706,7 +707,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             try
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                
+
                 // 使用异步方法读取列
                 var column = await groupReader.ReadColumnAsync(field);
                 columns[field.Name] = column;
@@ -714,10 +715,10 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             catch (Exception ex)
             {
                 // 如果读取某列失败，记录异常并继续
-                System.Diagnostics.Debug.WriteLine($"读取列 {field.Name} 失败: {ex.Message}");
+                Debug.WriteLine($"读取列 {field.Name} 失败: {ex.Message}");
             }
         }
-        
+
         return columns;
     }
 
@@ -755,7 +756,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
                     return true;
                 }
             }
-            
+
             return true; // 文件格式正确，但没有数据
         }
         catch
@@ -791,14 +792,14 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
             return;
 
         _reader?.Dispose();
-        
+
         if (_fileStream != null)
         {
             await _fileStream.DisposeAsync().ConfigureAwait(false);
         }
-        
+
         _isDisposed = true;
-        
+
         GC.SuppressFinalize(this);
     }
 
@@ -813,7 +814,7 @@ public class ParquetFileReader : IDisposable, IAsyncDisposable, IEnumerable
         _reader?.Dispose();
         _fileStream?.Dispose();
         _isDisposed = true;
-        
+
         GC.SuppressFinalize(this);
     }
 }
