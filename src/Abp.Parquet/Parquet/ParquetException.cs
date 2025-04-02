@@ -59,7 +59,7 @@ public class ParquetParserException : ParquetException
     public ParquetParserException(string message, Exception innerException) : base(message, innerException)
     {
     }
-    
+
     /// <summary>
     /// 构造函数
     /// </summary>
@@ -81,7 +81,7 @@ public class ParquetWriterException : ParquetException
     /// 写入操作的目标文件路径
     /// </summary>
     public string FilePath { get; }
-    
+
     /// <summary>
     /// 构造函数
     /// </summary>
@@ -89,7 +89,7 @@ public class ParquetWriterException : ParquetException
     public ParquetWriterException(string message) : base(message)
     {
     }
-    
+
     /// <summary>
     /// 构造函数
     /// </summary>
@@ -108,7 +108,7 @@ public class ParquetWriterException : ParquetException
     public ParquetWriterException(string message, Exception innerException) : base(message, innerException)
     {
     }
-    
+
     /// <summary>
     /// 构造函数
     /// </summary>
@@ -153,12 +153,12 @@ public class ParquetTypeConversionException : ParquetException
     /// 源类型
     /// </summary>
     public Type SourceType { get; }
-    
+
     /// <summary>
     /// 目标类型
     /// </summary>
     public Type TargetType { get; }
-    
+
     /// <summary>
     /// 字段名称
     /// </summary>
@@ -179,7 +179,7 @@ public class ParquetTypeConversionException : ParquetException
     /// <param name="sourceType">源类型</param>
     /// <param name="targetType">目标类型</param>
     /// <param name="fieldName">字段名称</param>
-    public ParquetTypeConversionException(string message, Type sourceType, Type targetType, string fieldName) 
+    public ParquetTypeConversionException(string message, Type sourceType, Type targetType, string fieldName)
         : base(message)
     {
         SourceType = sourceType;
@@ -195,7 +195,7 @@ public class ParquetTypeConversionException : ParquetException
     public ParquetTypeConversionException(string message, Exception innerException) : base(message, innerException)
     {
     }
-    
+
     /// <summary>
     /// 构造函数
     /// </summary>
@@ -204,12 +204,51 @@ public class ParquetTypeConversionException : ParquetException
     /// <param name="targetType">目标类型</param>
     /// <param name="fieldName">字段名称</param>
     /// <param name="innerException">内部异常</param>
-    public ParquetTypeConversionException(string message, Type sourceType, Type targetType, string fieldName, Exception innerException) 
+    public ParquetTypeConversionException(string message, Type sourceType, Type targetType, string fieldName, Exception innerException)
         : base(message, innerException)
     {
         SourceType = sourceType;
         TargetType = targetType;
         FieldName = fieldName;
+    }
+}
+
+/// <summary>
+/// Parquet 内存限制异常 - 当操作超出内存限制时使用
+/// </summary>
+public class ParquetMemoryLimitException : ParquetException
+{
+    /// <summary>
+    /// 请求的内存大小（字节）
+    /// </summary>
+    public long RequestedBytes { get; }
+
+    /// <summary>
+    /// 可用的内存限制（字节）
+    /// </summary>
+    public long AvailableBytes { get; }
+
+    /// <summary>
+    /// 构造函数
+    /// </summary>
+    /// <param name="message">错误消息</param>
+    /// <param name="requestedBytes">请求的内存大小</param>
+    /// <param name="availableBytes">可用内存限制</param>
+    public ParquetMemoryLimitException(string message, long requestedBytes, long availableBytes)
+        : base(message)
+    {
+        RequestedBytes = requestedBytes;
+        AvailableBytes = availableBytes;
+    }
+
+    /// <summary>
+    /// 构造函数
+    /// </summary>
+    /// <param name="message">错误消息</param>
+    /// <param name="innerException">内部异常</param>
+    public ParquetMemoryLimitException(string message, Exception innerException)
+        : base(message, innerException)
+    {
     }
 }
 
