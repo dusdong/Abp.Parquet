@@ -19,6 +19,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     private readonly string _filePath;
     private readonly ParquetSchema _schema;
     private readonly ParquetWriterConfiguration _configuration;
+    private readonly PropertyAccessor<T> _propertyAccessor;
     private readonly PropertyInfo[] _properties;
     private readonly ParquetSchemaGenerator<T> _schemaGenerator;
 
@@ -32,7 +33,11 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
 
     // 用于懒初始化的信号量
     private readonly SemaphoreSlim _initSemaphore = new SemaphoreSlim(1, 1);
+    private readonly SemaphoreSlim _writeSemaphore = new SemaphoreSlim(1, 1);
     private bool _isInitialized = false;
+
+    // 缓冲区池
+    private static readonly BufferPool _bufferPool = new BufferPool(1024 * 1024, 20); // 1MB缓冲区
 
     /// <summary>
     /// 私有构造函数，由CreateAsync工厂方法调用
@@ -67,6 +72,9 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
 
         // 使用反射获取类型 T 的所有公共属性
         _properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            
+        // 初始化高性能属性访问器
+        _propertyAccessor = new PropertyAccessor<T>(_properties);
     }
 
     /// <summary>
@@ -106,6 +114,10 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
             cancellationToken.ThrowIfCancellationRequested();
 
             var fileExists = File.Exists(_filePath);
+            var context = new Dictionary<string, object>
+            {
+                { "FileExists", fileExists }
+            };
 
             try
             {
@@ -148,19 +160,28 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
             {
                 // 清理资源并传播取消异常
                 await CleanupResourcesAsync();
-                throw new ParquetOperationCanceledException("Parquet 文件初始化操作已取消。");
+                throw new ParquetOperationCanceledException("Parquet 文件初始化操作已取消。", 
+                    "Initialize", _filePath);
             }
             catch (Exception ex)
             {
                 // 确保在初始化失败时释放资源
                 await CleanupResourcesAsync();
 
+                if (ex is UnauthorizedAccessException uae)
+                {
+                    throw new ParquetWriterException($"没有文件写入权限: {uae.Message}",
+                        "Initialize", _filePath, context, uae);
+                }
+                    
                 if (ex is IOException ioEx)
                 {
-                    throw new ParquetWriterException($"初始化 Parquet 写入器时发生 I/O 错误: {ioEx.Message}", _filePath, ioEx);
+                    throw new ParquetWriterException($"初始化 Parquet 写入器时发生 I/O 错误: {ioEx.Message}", 
+                        "Initialize", _filePath, context, ioEx);
                 }
 
-                throw new ParquetWriterException($"初始化 Parquet 写入器失败: {ex.Message}", _filePath, ex);
+                throw new ParquetWriterException($"初始化 Parquet 写入器失败: {ex.Message}", 
+                    "Initialize", _filePath, context, ex);
             }
         }
         finally
@@ -174,31 +195,11 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     /// </summary>
     private async Task CleanupResourcesAsync()
     {
-        if (_parquetWriter != null)
-        {
-            try
-            {
-                _parquetWriter.Dispose();
-                _parquetWriter = null;
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"释放 ParquetWriter 时发生错误: {ex.Message}");
-            }
-        }
-
-        if (_fileStream != null)
-        {
-            try
-            {
-                await _fileStream.DisposeAsync().ConfigureAwait(false);
-                _fileStream = null;
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"释放 FileStream 时发生错误: {ex.Message}");
-            }
-        }
+        await ResourceManager.SafeDisposeAsync(_parquetWriter);
+        await ResourceManager.SafeCloseStreamAsync(_fileStream);
+            
+        _parquetWriter = null;
+        _fileStream = null;
     }
 
     /// <summary>
@@ -229,85 +230,12 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
         if (records == null || !records.Any())
             return;
 
-        // 确保初始化 - 同步等待异步初始化
-        InitializeAsync().GetAwaiter().GetResult();
-
-        try
+        // 确保避免死锁 - 使用Task.Run包装整个异步操作
+        Task.Run(async () => 
         {
-            // 如果数据量很大，分批处理
-            if (records.Count > _configuration.BatchSize)
-            {
-                WriteBatched(records);
-                return;
-            }
-
-            // 注意：创建的是同步调用
-            using var rowGroupWriter = _parquetWriter.CreateRowGroup();
-
-            // 构建字段名称到 DataField 的字典
-            var dataFieldDict = _schema.Fields
-                .OfType<DataField>()
-                .ToDictionary(f => f.Name, f => f);
-
-            // 自动创建 DataColumn 列表
-            var dataColumns = CreateDataColumns(records, dataFieldDict);
-
-            // 写入所有列 - 由于WriteColumnAsync只有异步版本，所以在同步方法中同步等待
-            foreach (var dataColumn in dataColumns)
-            {
-                // 使用同步等待异步操作
-                rowGroupWriter.WriteColumnAsync(dataColumn).GetAwaiter().GetResult();
-            }
-
-            // 刷新流，确保数据写入
-            _fileStream.Flush();
-        }
-        catch (Exception ex)
-        {
-            throw new ParquetWriterException($"写入Parquet数据失败: {ex.Message}", _filePath, ex);
-        }
-    }
-
-    /// <summary>
-    /// 分批写入大量记录 (同步版本)
-    /// </summary>
-    /// <param name="records">要写入的数据列表</param>
-    private void WriteBatched(List<T> records)
-    {
-        int batchSize = _configuration.BatchSize;
-        int totalRecords = records.Count;
-
-        // 计算需要多少批次
-        int batchCount = (totalRecords + batchSize - 1) / batchSize;
-
-        for (int i = 0; i < batchCount; i++)
-        {
-            int skip = i * batchSize;
-            int take = Math.Min(batchSize, totalRecords - skip);
-
-            // 获取当前批次的数据
-            var batch = records.GetRange(skip, take);
-
-            // 写入批次数据
-            using var rowGroupWriter = _parquetWriter.CreateRowGroup();
-
-            // 构建字段名称到 DataField 的字典
-            var dataFieldDict = _schema.Fields
-                .OfType<DataField>()
-                .ToDictionary(f => f.Name, f => f);
-
-            // 自动创建 DataColumn 列表
-            var dataColumns = CreateDataColumns(batch, dataFieldDict);
-
-            // 写入所有列
-            foreach (var dataColumn in dataColumns)
-            {
-                rowGroupWriter.WriteColumnAsync(dataColumn).GetAwaiter().GetResult();
-            }
-        }
-
-        // 最后刷新流，确保所有数据写入
-        _fileStream.Flush();
+            await InitializeAsync().ConfigureAwait(false);
+            await InternalWriteAsync(records, CancellationToken.None).ConfigureAwait(false);
+        }).GetAwaiter().GetResult();
     }
 
     /// <summary>
@@ -326,7 +254,17 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
 
         // 确保初始化
         await InitializeAsync(cancellationToken).ConfigureAwait(false);
+            
+        // 调用共享的内部写入方法
+        await InternalWriteAsync(records, cancellationToken).ConfigureAwait(false);
+    }
 
+    /// <summary>
+    /// 内部共享写入逻辑
+    /// </summary>
+    private async Task InternalWriteAsync(List<T> records, CancellationToken cancellationToken)
+    {
+        await _writeSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             // 如果数据量很大，分批处理
@@ -347,10 +285,11 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
                     .OfType<DataField>()
                     .ToDictionary(f => f.Name, f => f);
 
-                // 自动创建 DataColumn 列表 - 这是CPU密集型的，可以考虑在后台线程执行
-                var dataColumns = await Task.Run(() => CreateDataColumns(records, dataFieldDict), cancellationToken);
+                // 自动创建 DataColumn 列表 - 这是CPU密集型的，放在后台线程执行
+                var dataColumns = await Task.Run(() => 
+                    CreateDataColumns(records, dataFieldDict), cancellationToken);
 
-                // 写入所有列 - 使用正确的异步方法，并传递取消令牌
+                // 写入所有列
                 foreach (var dataColumn in dataColumns)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -359,15 +298,27 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
             }
 
             // 异步刷新流
-            await _fileStream.FlushAsync(cancellationToken);
+            await _fileStream.FlushAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
-            throw new ParquetOperationCanceledException("Parquet 写入操作已被取消。");
+            throw new ParquetOperationCanceledException("Parquet 写入操作已被取消。", 
+                "Write", _filePath);
         }
         catch (Exception ex)
         {
-            throw new ParquetWriterException($"异步写入Parquet数据失败: {ex.Message}", _filePath, ex);
+            var context = new Dictionary<string, object>
+            {
+                { "RecordCount", records.Count },
+                { "RecordType", typeof(T).Name }
+            };
+                
+            throw new ParquetWriterException($"写入Parquet数据失败: {ex.Message}", 
+                "Write", _filePath, context, ex);
+        }
+        finally
+        {
+            _writeSemaphore.Release();
         }
     }
 
@@ -384,40 +335,60 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
 
         // 计算需要多少批次
         int batchCount = (totalRecords + batchSize - 1) / batchSize;
-
-        for (int i = 0; i < batchCount; i++)
+            
+        var progressContext = new Dictionary<string, object>
         {
-            cancellationToken.ThrowIfCancellationRequested();
+            { "TotalRecords", totalRecords },
+            { "BatchSize", batchSize },
+            { "BatchCount", batchCount }
+        };
 
-            int skip = i * batchSize;
-            int take = Math.Min(batchSize, totalRecords - skip);
-
-            // 获取当前批次的数据
-            var batch = records.GetRange(skip, take);
-
-            // 写入批次数据
-            var rowGroupWriter = _parquetWriter.CreateRowGroup();
-            using (rowGroupWriter)
+        try
+        {
+            for (int i = 0; i < batchCount; i++)
             {
-                // 构建字段名称到 DataField 的字典
-                var dataFieldDict = _schema.Fields
-                    .OfType<DataField>()
-                    .ToDictionary(f => f.Name, f => f);
+                cancellationToken.ThrowIfCancellationRequested();
 
-                // 自动创建 DataColumn 列表
-                var dataColumns = await Task.Run(() => CreateDataColumns(batch, dataFieldDict), cancellationToken);
+                int skip = i * batchSize;
+                int take = Math.Min(batchSize, totalRecords - skip);
+                    
+                progressContext["CurrentBatch"] = i + 1;
+                progressContext["ProcessedRecords"] = skip + take;
+                progressContext["ProgressPercent"] = ((skip + take) * 100.0) / totalRecords;
 
-                // 写入所有列
-                foreach (var dataColumn in dataColumns)
+                // 获取当前批次的数据
+                var batch = records.GetRange(skip, take);
+
+                // 写入批次数据
+                var rowGroupWriter = _parquetWriter.CreateRowGroup();
+                using (rowGroupWriter)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    await rowGroupWriter.WriteColumnAsync(dataColumn);
+                    // 构建字段名称到 DataField 的字典
+                    var dataFieldDict = _schema.Fields
+                        .OfType<DataField>()
+                        .ToDictionary(f => f.Name, f => f);
+
+                    // 自动创建 DataColumn 列表 - CPU密集型，放在后台线程执行
+                    var dataColumns = await Task.Run(() => 
+                        CreateDataColumns(batch, dataFieldDict), cancellationToken);
+
+                    // 写入所有列
+                    foreach (var dataColumn in dataColumns)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        await rowGroupWriter.WriteColumnAsync(dataColumn);
+                    }
                 }
             }
-        }
 
-        // 最后异步刷新流，确保所有数据写入
-        await _fileStream.FlushAsync(cancellationToken);
+            // 最后异步刷新流，确保所有数据写入
+            await _fileStream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            throw new ParquetWriterException($"批处理写入失败: {ex.Message}", 
+                "WriteBatched", _filePath, progressContext, ex);
+        }
     }
 
     /// <summary>
@@ -425,11 +396,13 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     /// </summary>
     /// <param name="records">要写入的数据流</param>
     /// <param name="batchSize">批处理大小</param>
+    /// <param name="progress">进度报告</param>
     /// <param name="cancellationToken">取消令牌</param>
     /// <returns>完成任务</returns>
     public async Task WriteStreamingAsync(
         IEnumerable<T> records,
         int batchSize = DefaultBatchSize,
+        IProgress<(int ProcessedCount, TimeSpan ElapsedTime)> progress = null,
         CancellationToken cancellationToken = default)
     {
         if (_isDisposed)
@@ -441,41 +414,55 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
         // 确保初始化
         await InitializeAsync(cancellationToken).ConfigureAwait(false);
 
+        await _writeSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
             // 使用可重用的缓冲区收集记录
             var buffer = new List<T>(batchSize);
-            int count = 0;
+            int processedCount = 0;
+            var stopwatch = Stopwatch.StartNew();
 
             foreach (var record in records)
             {
                 cancellationToken.ThrowIfCancellationRequested();
 
                 buffer.Add(record);
-                count++;
+                processedCount++;
 
                 // 当达到批处理大小时写入
-                if (count >= batchSize)
+                if (buffer.Count >= batchSize)
                 {
                     await WriteBufferAsync(buffer, cancellationToken);
+                        
+                    // 报告进度
+                    progress?.Report((processedCount, stopwatch.Elapsed));
+                        
                     buffer.Clear();
-                    count = 0;
                 }
             }
 
             // 写入剩余记录
-            if (count > 0)
+            if (buffer.Count > 0)
             {
                 await WriteBufferAsync(buffer, cancellationToken);
+                    
+                // 最终进度报告
+                progress?.Report((processedCount, stopwatch.Elapsed));
             }
         }
         catch (OperationCanceledException)
         {
-            throw new ParquetOperationCanceledException("Parquet 流式写入操作已被取消。");
+            throw new ParquetOperationCanceledException("Parquet 流式写入操作已被取消。", 
+                "WriteStreaming", _filePath);
         }
         catch (Exception ex)
         {
-            throw new ParquetWriterException($"流式写入 Parquet 数据失败: {ex.Message}", _filePath, ex);
+            throw new ParquetWriterException($"流式写入 Parquet 数据失败: {ex.Message}", 
+                "WriteStreaming", _filePath, null, ex);
+        }
+        finally
+        {
+            _writeSemaphore.Release();
         }
     }
 
@@ -523,105 +510,26 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
                 continue;
             }
 
-            // 使用反射获取对应属性
-            var property = _properties.FirstOrDefault(p => p.Name.Equals(fieldName, StringComparison.OrdinalIgnoreCase));
-            if (property == null)
+            // 检查是否有对应的属性访问器
+            if (!_propertyAccessor.HasProperty(fieldName))
             {
-                // 属性不存在，记录警告并忽略该字段
                 Debug.WriteLine($"警告: 属性 '{fieldName}' 在类型 '{typeof(T).Name}' 中未找到，字段将被忽略。");
                 continue;
             }
 
             try
             {
-                // 提取字段值
-                var rawValues = records.Select(r => property.GetValue(r, null)).ToArray();
+                // 使用预编译的属性访问器提取字段值 - 比反射快很多
+                var rawValues = records.Select(r => _propertyAccessor.GetValue(r, fieldName)).ToArray();
                 Array fieldValues;
 
                 if (field.IsNullable)
                 {
-                    if (originalPropertyType.IsValueType && Nullable.GetUnderlyingType(originalPropertyType) != null)
-                    {
-                        // 处理可空值类型（如 int?）
-                        Type baseType = Nullable.GetUnderlyingType(originalPropertyType);
-                        if (baseType == null)
-                        {
-                            throw new ParquetWriterException($"无法获取字段 '{fieldName}' 的基础类型。");
-                        }
-
-                        // 创建 Nullable<T> 数组
-                        var typedArray = Array.CreateInstance(originalPropertyType, rawValues.Length);
-                        for (int i = 0; i < rawValues.Length; i++)
-                        {
-                            if (rawValues[i] != null)
-                            {
-                                try
-                                {
-                                    typedArray.SetValue(Convert.ChangeType(rawValues[i], baseType), i);
-                                }
-                                catch (Exception ex)
-                                {
-                                    throw new ParquetTypeConversionException(
-                                        $"转换类型失败: {rawValues[i]} -> {baseType.Name}",
-                                        rawValues[i]?.GetType(), baseType, fieldName, ex);
-                                }
-                            }
-                            else
-                            {
-                                typedArray.SetValue(null, i);
-                            }
-                        }
-
-                        fieldValues = typedArray;
-                    }
-                    else if (!originalPropertyType.IsValueType)
-                    {
-                        // 处理引用类型（如 string）
-                        // 确保生成 string[] 而不是 object[]
-                        fieldValues = rawValues.Select(val => val != null ? val.ToString() : null).ToArray();
-                    }
-                    else
-                    {
-                        throw new ParquetWriterException($"字段 '{fieldName}' 的类型无法处理。");
-                    }
+                    fieldValues = ConvertToNullableArray(rawValues, fieldName, originalPropertyType, field.ClrType);
                 }
                 else
                 {
-                    // 非可空类型，直接转换
-                    if (field.ClrType.IsValueType)
-                    {
-                        // 创建具体类型的数组
-                        Type targetType = field.ClrType;
-                        var typedArray = Array.CreateInstance(targetType, rawValues.Length);
-                        for (int i = 0; i < rawValues.Length; i++)
-                        {
-                            if (rawValues[i] != null)
-                            {
-                                try
-                                {
-                                    typedArray.SetValue(Convert.ChangeType(rawValues[i], targetType), i);
-                                }
-                                catch (Exception ex)
-                                {
-                                    throw new ParquetTypeConversionException(
-                                        $"转换类型失败: {rawValues[i]} -> {targetType.Name}",
-                                        rawValues[i]?.GetType(), targetType, fieldName, ex);
-                                }
-                            }
-                            else
-                            {
-                                // 使用默认值避免 null
-                                typedArray.SetValue(GetDefault(targetType), i);
-                            }
-                        }
-
-                        fieldValues = typedArray;
-                    }
-                    else
-                    {
-                        // 处理引用类型（如 string）
-                        fieldValues = rawValues.Select(val => val != null ? val.ToString() : null).ToArray();
-                    }
+                    fieldValues = ConvertToNonNullableArray(rawValues, fieldName, field.ClrType);
                 }
 
                 // 创建 DataColumn 并添加到列表
@@ -635,11 +543,125 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
             }
             catch (Exception ex)
             {
-                throw new ParquetWriterException($"写入字段 '{fieldName}' 时发生错误: {ex.Message}", ex);
+                throw new ParquetWriterException($"写入字段 '{fieldName}' 时发生错误: {ex.Message}", 
+                    "CreateDataColumns", null, 
+                    new Dictionary<string, object> { { "FieldName", fieldName } }, ex);
             }
         }
 
         return dataColumns;
+    }
+
+    /// <summary>
+    /// 转换为可空数组
+    /// </summary>
+    private Array ConvertToNullableArray(object[] rawValues, string fieldName, Type originalPropertyType, Type targetType)
+    {
+        // 处理可空值类型（如 int?）
+        if (originalPropertyType.IsValueType && Nullable.GetUnderlyingType(originalPropertyType) != null)
+        {
+            Type baseType = Nullable.GetUnderlyingType(originalPropertyType);
+            if (baseType == null)
+            {
+                throw new ParquetWriterException($"无法获取字段 '{fieldName}' 的基础类型。");
+            }
+
+            // 创建 Nullable<T> 数组
+            var typedArray = Array.CreateInstance(originalPropertyType, rawValues.Length);
+            for (int i = 0; i < rawValues.Length; i++)
+            {
+                if (rawValues[i] != null)
+                {
+                    try
+                    {
+                        typedArray.SetValue(Convert.ChangeType(rawValues[i], baseType), i);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new ParquetTypeConversionException(
+                            $"转换类型失败: {rawValues[i]} -> {baseType.Name}",
+                            rawValues[i]?.GetType(), baseType, fieldName, "TypeConversion", null, ex);
+                    }
+                }
+                else
+                {
+                    typedArray.SetValue(null, i);
+                }
+            }
+
+            return typedArray;
+        }
+        else if (!originalPropertyType.IsValueType)
+        {
+            // 处理引用类型（如 string）
+            if (originalPropertyType == typeof(string))
+            {
+                return rawValues.Select(val => val?.ToString()).ToArray();
+            }
+            else
+            {
+                // 为其他引用类型创建适当的数组
+                var resultArray = Array.CreateInstance(targetType, rawValues.Length);
+                for (int i = 0; i < rawValues.Length; i++)
+                {
+                    if (rawValues[i] != null)
+                    {
+                        try
+                        {
+                            resultArray.SetValue(Convert.ChangeType(rawValues[i], targetType), i);
+                        }
+                        catch (Exception ex)
+                        {
+                            throw new ParquetTypeConversionException(
+                                $"转换引用类型失败: {rawValues[i]} -> {targetType.Name}",
+                                rawValues[i]?.GetType(), targetType, fieldName, "TypeConversion", null, ex);
+                        }
+                    }
+                    else
+                    {
+                        resultArray.SetValue(null, i);
+                    }
+                }
+                return resultArray;
+            }
+        }
+        else
+        {
+            throw new ParquetWriterException($"字段 '{fieldName}' 的类型无法处理: {originalPropertyType.Name}");
+        }
+    }
+
+    /// <summary>
+    /// 转换为非可空数组
+    /// </summary>
+    private Array ConvertToNonNullableArray(object[] rawValues, string fieldName, Type targetType)
+    {
+        // 创建具体类型的数组
+        var typedArray = Array.CreateInstance(targetType, rawValues.Length);
+            
+        for (int i = 0; i < rawValues.Length; i++)
+        {
+            if (rawValues[i] != null)
+            {
+                try
+                {
+                    typedArray.SetValue(Convert.ChangeType(rawValues[i], targetType), i);
+                }
+                catch (Exception ex)
+                {
+                    throw new ParquetTypeConversionException(
+                        $"转换类型失败: {rawValues[i]} -> {targetType.Name}",
+                        rawValues[i]?.GetType(), targetType, fieldName, "TypeConversion", null, ex);
+                }
+            }
+            else
+            {
+                // 使用默认值避免 null
+                typedArray.SetValue(GetDefault(targetType), i);
+            }
+        }
+            
+        return typedArray;
     }
 
     /// <summary>
@@ -658,11 +680,14 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     {
         if (_isDisposed)
             return;
-
+                
+        _isInitialized = false;
         await CleanupResourcesAsync();
-        _initSemaphore?.Dispose();
+            
+        ResourceManager.SafeDispose(_initSemaphore);
+        ResourceManager.SafeDispose(_writeSemaphore);
+            
         _isDisposed = true;
-
         GC.SuppressFinalize(this);
     }
 
@@ -673,12 +698,15 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     {
         if (_isDisposed)
             return;
-
-        _parquetWriter?.Dispose();
-        _fileStream?.Dispose();
-        _initSemaphore?.Dispose();
+                
+        _isInitialized = false;
+            
+        ResourceManager.SafeDispose(_parquetWriter);
+        ResourceManager.SafeDispose(_fileStream);
+        ResourceManager.SafeDispose(_initSemaphore);
+        ResourceManager.SafeDispose(_writeSemaphore);
+            
         _isDisposed = true;
-
         GC.SuppressFinalize(this);
     }
 }
