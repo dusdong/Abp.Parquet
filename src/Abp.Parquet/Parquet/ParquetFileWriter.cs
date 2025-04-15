@@ -30,6 +30,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     private FileStream _fileStream;
     private ParquetWriter _parquetWriter;
     private bool _isDisposed = false;
+    private readonly bool _ownsStream; // 标记是否拥有流的所有权
 
     // 用于懒初始化的信号量
     private readonly SemaphoreSlim _initSemaphore = new SemaphoreSlim(1, 1);
@@ -43,11 +44,36 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     /// 私有构造函数，由CreateAsync工厂方法调用
     /// </summary>
     private ParquetFileWriter(string filePath, ParquetSchema schema = null, ParquetWriterConfiguration configuration = null)
+        : this(schema, configuration)
     {
         if (string.IsNullOrWhiteSpace(filePath))
             throw new ArgumentException("文件路径不能为空。", nameof(filePath));
 
         _filePath = filePath;
+        _ownsStream = true; // 我们将自己创建和管理流
+    }
+
+    /// <summary>
+    /// 私有构造函数，接受已打开的文件流
+    /// </summary>
+    private ParquetFileWriter(FileStream fileStream, ParquetSchema schema = null, ParquetWriterConfiguration configuration = null)
+        : this(schema, configuration)
+    {
+        if (fileStream == null)
+            throw new ArgumentNullException(nameof(fileStream));
+        if (!fileStream.CanWrite)
+            throw new ArgumentException("文件流必须可写。", nameof(fileStream));
+
+        _fileStream = fileStream;
+        _filePath = fileStream.Name; // 保存文件路径以便日志和错误报告
+        _ownsStream = false; // 流由调用者所有，我们不负责关闭
+    }
+
+    /// <summary>
+    /// 通用构造函数初始化共享字段
+    /// </summary>
+    private ParquetFileWriter(ParquetSchema schema = null, ParquetWriterConfiguration configuration = null)
+    {
         _configuration = configuration ?? new ParquetWriterConfiguration();
 
         if (schema != null)
@@ -72,13 +98,13 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
 
         // 使用反射获取类型 T 的所有公共属性
         _properties = typeof(T).GetProperties(BindingFlags.Public | BindingFlags.Instance);
-            
+
         // 初始化高性能属性访问器
         _propertyAccessor = new PropertyAccessor<T>(_properties);
     }
 
     /// <summary>
-    /// 创建 ParquetFileWriter 的异步工厂方法
+    /// 创建 ParquetFileWriter 的异步工厂方法，使用文件路径
     /// </summary>
     /// <param name="filePath">目标 Parquet 文件路径</param>
     /// <param name="schema">可选的 Parquet 架构，如果为 null，则自动生成</param>
@@ -92,6 +118,25 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
         CancellationToken cancellationToken = default)
     {
         var writer = new ParquetFileWriter<T>(filePath, schema, configuration);
+        await writer.InitializeAsync(cancellationToken).ConfigureAwait(false);
+        return writer;
+    }
+
+    /// <summary>
+    /// 创建 ParquetFileWriter 的异步工厂方法，使用已打开的文件流
+    /// </summary>
+    /// <param name="fileStream">已打开的文件流，必须具有写入权限</param>
+    /// <param name="schema">可选的 Parquet 架构，如果为 null，则自动生成</param>
+    /// <param name="configuration">可选的配置对象，如果为 null，则使用默认配置</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>初始化完成的 ParquetFileWriter 实例</returns>
+    public static async Task<ParquetFileWriter<T>> CreateAsync(
+        FileStream fileStream,
+        ParquetSchema schema = null,
+        ParquetWriterConfiguration configuration = null,
+        CancellationToken cancellationToken = default)
+    {
+        var writer = new ParquetFileWriter<T>(fileStream, schema, configuration);
         await writer.InitializeAsync(cancellationToken).ConfigureAwait(false);
         return writer;
     }
@@ -113,29 +158,39 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
 
             cancellationToken.ThrowIfCancellationRequested();
 
-            var fileExists = File.Exists(_filePath);
-            var context = new Dictionary<string, object>
-            {
-                { "FileExists", fileExists }
-            };
+            bool fileExists = false;
+            var context = new Dictionary<string, object>();
 
             try
             {
-                // 确保目录存在
-                var directory = Path.GetDirectoryName(_filePath);
-                if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                // 如果流未初始化，需要创建
+                if (_fileStream == null)
                 {
-                    Directory.CreateDirectory(directory);
-                }
+                    fileExists = File.Exists(_filePath);
+                    context["FileExists"] = fileExists;
 
-                // 打开 FileStream - 这是真正的异步IO操作
-                _fileStream = new FileStream(
-                    _filePath,
-                    fileExists ? FileMode.Open : FileMode.Create,
-                    FileAccess.ReadWrite,
-                    FileShare.Read,
-                    4096, // 默认缓冲区大小
-                    FileOptions.Asynchronous); // 启用异步IO
+                    var directory = Path.GetDirectoryName(_filePath);
+                    if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+                    {
+                        Directory.CreateDirectory(directory);
+                    }
+
+                    // 打开 FileStream - 这是真正的异步IO操作
+                    _fileStream = new FileStream(
+                        _filePath,
+                        fileExists ? FileMode.Open : FileMode.Create,
+                        FileAccess.ReadWrite,
+                        FileShare.Read,
+                        4096, // 默认缓冲区大小
+                        FileOptions.Asynchronous); // 启用异步IO
+                }
+                else
+                {
+                    // 使用现有的流，检查是否为空
+                    fileExists = _fileStream.Length > 0;
+                    context["FileExists"] = fileExists;
+                    context["StreamLength"] = _fileStream.Length;
+                }
 
                 if (fileExists)
                 {
@@ -160,7 +215,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
             {
                 // 清理资源并传播取消异常
                 await CleanupResourcesAsync();
-                throw new ParquetOperationCanceledException("Parquet 文件初始化操作已取消。", 
+                throw new ParquetOperationCanceledException("Parquet 文件初始化操作已取消。",
                     "Initialize", _filePath);
             }
             catch (Exception ex)
@@ -173,14 +228,14 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
                     throw new ParquetWriterException($"没有文件写入权限: {uae.Message}",
                         "Initialize", _filePath, context, uae);
                 }
-                    
+
                 if (ex is IOException ioEx)
                 {
-                    throw new ParquetWriterException($"初始化 Parquet 写入器时发生 I/O 错误: {ioEx.Message}", 
+                    throw new ParquetWriterException($"初始化 Parquet 写入器时发生 I/O 错误: {ioEx.Message}",
                         "Initialize", _filePath, context, ioEx);
                 }
 
-                throw new ParquetWriterException($"初始化 Parquet 写入器失败: {ex.Message}", 
+                throw new ParquetWriterException($"初始化 Parquet 写入器失败: {ex.Message}",
                     "Initialize", _filePath, context, ex);
             }
         }
@@ -196,10 +251,18 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     private async Task CleanupResourcesAsync()
     {
         await ResourceManager.SafeDisposeAsync(_parquetWriter);
-        await ResourceManager.SafeCloseStreamAsync(_fileStream);
-            
+
+        // 只有当我们拥有流时才关闭它
+        if (_ownsStream)
+        {
+            await ResourceManager.SafeCloseStreamAsync(_fileStream);
+        }
+
         _parquetWriter = null;
-        _fileStream = null;
+        if (_ownsStream)
+        {
+            _fileStream = null;
+        }
     }
 
     /// <summary>
@@ -231,7 +294,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
             return;
 
         // 确保避免死锁 - 使用Task.Run包装整个异步操作
-        Task.Run(async () => 
+        Task.Run(async () =>
         {
             await InitializeAsync().ConfigureAwait(false);
             await InternalWriteAsync(records, CancellationToken.None).ConfigureAwait(false);
@@ -254,7 +317,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
 
         // 确保初始化
         await InitializeAsync(cancellationToken).ConfigureAwait(false);
-            
+
         // 调用共享的内部写入方法
         await InternalWriteAsync(records, cancellationToken).ConfigureAwait(false);
     }
@@ -286,7 +349,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
                     .ToDictionary(f => f.Name, f => f);
 
                 // 自动创建 DataColumn 列表 - 这是CPU密集型的，放在后台线程执行
-                var dataColumns = await Task.Run(() => 
+                var dataColumns = await Task.Run(() =>
                     CreateDataColumns(records, dataFieldDict), cancellationToken);
 
                 // 写入所有列
@@ -302,7 +365,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
         }
         catch (OperationCanceledException)
         {
-            throw new ParquetOperationCanceledException("Parquet 写入操作已被取消。", 
+            throw new ParquetOperationCanceledException("Parquet 写入操作已被取消。",
                 "Write", _filePath);
         }
         catch (Exception ex)
@@ -312,8 +375,8 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
                 { "RecordCount", records.Count },
                 { "RecordType", typeof(T).Name }
             };
-                
-            throw new ParquetWriterException($"写入Parquet数据失败: {ex.Message}", 
+
+            throw new ParquetWriterException($"写入Parquet数据失败: {ex.Message}",
                 "Write", _filePath, context, ex);
         }
         finally
@@ -335,7 +398,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
 
         // 计算需要多少批次
         int batchCount = (totalRecords + batchSize - 1) / batchSize;
-            
+
         var progressContext = new Dictionary<string, object>
         {
             { "TotalRecords", totalRecords },
@@ -351,7 +414,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
 
                 int skip = i * batchSize;
                 int take = Math.Min(batchSize, totalRecords - skip);
-                    
+
                 progressContext["CurrentBatch"] = i + 1;
                 progressContext["ProcessedRecords"] = skip + take;
                 progressContext["ProgressPercent"] = ((skip + take) * 100.0) / totalRecords;
@@ -369,7 +432,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
                         .ToDictionary(f => f.Name, f => f);
 
                     // 自动创建 DataColumn 列表 - CPU密集型，放在后台线程执行
-                    var dataColumns = await Task.Run(() => 
+                    var dataColumns = await Task.Run(() =>
                         CreateDataColumns(batch, dataFieldDict), cancellationToken);
 
                     // 写入所有列
@@ -386,7 +449,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
         }
         catch (Exception ex)
         {
-            throw new ParquetWriterException($"批处理写入失败: {ex.Message}", 
+            throw new ParquetWriterException($"批处理写入失败: {ex.Message}",
                 "WriteBatched", _filePath, progressContext, ex);
         }
     }
@@ -433,10 +496,10 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
                 if (buffer.Count >= batchSize)
                 {
                     await WriteBufferAsync(buffer, cancellationToken);
-                        
+
                     // 报告进度
                     progress?.Report((processedCount, stopwatch.Elapsed));
-                        
+
                     buffer.Clear();
                 }
             }
@@ -445,19 +508,19 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
             if (buffer.Count > 0)
             {
                 await WriteBufferAsync(buffer, cancellationToken);
-                    
+
                 // 最终进度报告
                 progress?.Report((processedCount, stopwatch.Elapsed));
             }
         }
         catch (OperationCanceledException)
         {
-            throw new ParquetOperationCanceledException("Parquet 流式写入操作已被取消。", 
+            throw new ParquetOperationCanceledException("Parquet 流式写入操作已被取消。",
                 "WriteStreaming", _filePath);
         }
         catch (Exception ex)
         {
-            throw new ParquetWriterException($"流式写入 Parquet 数据失败: {ex.Message}", 
+            throw new ParquetWriterException($"流式写入 Parquet 数据失败: {ex.Message}",
                 "WriteStreaming", _filePath, null, ex);
         }
         finally
@@ -543,8 +606,8 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
             }
             catch (Exception ex)
             {
-                throw new ParquetWriterException($"写入字段 '{fieldName}' 时发生错误: {ex.Message}", 
-                    "CreateDataColumns", null, 
+                throw new ParquetWriterException($"写入字段 '{fieldName}' 时发生错误: {ex.Message}",
+                    "CreateDataColumns", null,
                     new Dictionary<string, object> { { "FieldName", fieldName } }, ex);
             }
         }
@@ -622,6 +685,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
                         resultArray.SetValue(null, i);
                     }
                 }
+
                 return resultArray;
             }
         }
@@ -638,7 +702,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     {
         // 创建具体类型的数组
         var typedArray = Array.CreateInstance(targetType, rawValues.Length);
-            
+
         for (int i = 0; i < rawValues.Length; i++)
         {
             if (rawValues[i] != null)
@@ -660,7 +724,7 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
                 typedArray.SetValue(GetDefault(targetType), i);
             }
         }
-            
+
         return typedArray;
     }
 
@@ -680,13 +744,13 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     {
         if (_isDisposed)
             return;
-                
+
         _isInitialized = false;
         await CleanupResourcesAsync();
-            
+
         ResourceManager.SafeDispose(_initSemaphore);
         ResourceManager.SafeDispose(_writeSemaphore);
-            
+
         _isDisposed = true;
         GC.SuppressFinalize(this);
     }
@@ -698,14 +762,18 @@ public class ParquetFileWriter<T> : IDisposable, IAsyncDisposable
     {
         if (_isDisposed)
             return;
-                
+
         _isInitialized = false;
-            
+
         ResourceManager.SafeDispose(_parquetWriter);
-        ResourceManager.SafeDispose(_fileStream);
+        if (_ownsStream)
+        {
+            ResourceManager.SafeDispose(_fileStream);
+        }
+
         ResourceManager.SafeDispose(_initSemaphore);
         ResourceManager.SafeDispose(_writeSemaphore);
-            
+
         _isDisposed = true;
         GC.SuppressFinalize(this);
     }
