@@ -121,7 +121,7 @@ public class ParquetTypeConversionException : ParquetException
     /// 字段名称
     /// </summary>
     public string FieldName => 
-        Context.TryGetValue("FieldName", out var field) ? field as string : null;
+        Context.TryGetValue("FieldName", out var fieldVal) ? fieldVal as string : null;
 
     /// <summary>
     /// 构造函数
